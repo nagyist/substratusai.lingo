@@ -19,10 +19,11 @@ package modelcontroller
 import (
 	"context"
 	"fmt"
-	"math"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -33,6 +34,7 @@ import (
 
 	kubeaiv1 "github.com/substratusai/kubeai/api/v1"
 	"github.com/substratusai/kubeai/internal/config"
+	"github.com/substratusai/kubeai/internal/k8sutils"
 	utils "github.com/substratusai/kubeai/internal/k8sutils"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -49,12 +51,8 @@ type ModelReconciler struct {
 	HuggingfaceSecretName   string
 	ResourceProfiles        map[string]config.ResourceProfile
 	ModelServers            config.ModelServers
-}
-
-type ServerImages struct {
-	Ollama  string
-	VLLMCPU string
-	VLLMGPU string
+	ModelServerPods         config.ModelServerPods
+	ModelRollouts           config.ModelRollouts
 }
 
 // +kubebuilder:rbac:groups=kubeai.org,resources=models,verbs=get;list;watch;create;update;patch;delete
@@ -68,37 +66,31 @@ type ServerImages struct {
 
 func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
+	log.Info("Reconciling Model")
 
 	model := &kubeaiv1.Model{}
 	if err := r.Get(ctx, req.NamespacedName, model); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	status0 := model.Status.DeepCopy()
+
 	var shouldUpdate bool
-	if model.Spec.Replicas == nil {
-		shouldUpdate = true
-		model.Spec.Replicas = ptr.To(model.Spec.MinReplicas)
-	}
-	{
-		changed, err := r.applyResourceProfile(model)
-		if err != nil {
-			log.Error(err, "applying resource profile")
-			// No use in retrying here, return nil error.
-			return ctrl.Result{}, nil
-		}
-		if changed {
-			log.Info("applied resource profile")
-			shouldUpdate = true
-		}
-	}
 	// Apply self labels based on features so that we can easily filter models.
-	if changed := r.applySelfLabels(model); changed {
-		shouldUpdate = true
+	shouldUpdate = r.applySelfLabels(model) || shouldUpdate
+	// Apply replica bounds to handle cases where min/max replicas were updated but a scale event was not triggered.
+	if !model.Spec.AutoscalingDisabled {
+		shouldUpdate = r.applyAutoscalingReplicaBounds(model) || shouldUpdate
 	}
 	if shouldUpdate {
-		if err := r.Update(ctx, model); err != nil {
+		if err := r.Update(ctx, model, k8sutils.DefaultUpdateOptions()); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating model: %w", err)
 		}
+	}
+
+	modelConfig, err := r.getModelConfig(model)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("getting model profile: %w", err)
 	}
 
 	allPods := &corev1.PodList{}
@@ -108,64 +100,22 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, fmt.Errorf("listing all node pools: %w", err)
 	}
 
-	scaleActual := int32(len(allPods.Items))
-	scaleDesired := *model.Spec.Replicas
-	scaleDiff := scaleActual - scaleDesired
-	scaleDiffAbs := int32(math.Abs(float64(scaleDiff)))
-
-	// TODO: Take into account Pods that are in a deletion state.
-
-	var podForModel func(*kubeaiv1.Model, int32) *corev1.Pod
-	switch model.Spec.Engine {
-	case kubeaiv1.OLlamaEngine:
-		podForModel = r.oLlamaPodForModel
-	default:
-		podForModel = r.vLLMPodForModel
-	}
-
-	switch {
-	case scaleDiff == 0:
-		// At correct scale.
-		log.Info("Pod count matches", "actualReplicas", scaleActual, "desiredReplicas", scaleDesired)
-	case scaleDiff < 0:
-		// Create Pods.
-		log.Info("Need to add pods", "scaleDiff", scaleDiff)
-
-		var toCreate []*corev1.Pod
-		for i := int32(0); i < scaleDiffAbs; i++ {
-			toCreate = append(toCreate, podForModel(model, scaleActual+i))
+	plan := r.calculatePodPlan(allPods, model, modelConfig)
+	if plan.containsActions() {
+		changed, err := plan.execute(ctx, r.Client, r.Scheme)
+		if changed {
+			// Slow things down to wait for caches to sync.
+			// This is important because the pod plan has some calculations that
+			// assume the cache is up to date.
+			// TODO: Use "epectations" instead of a wait - see the ReplicaSet controller.
+			time.Sleep(3 * time.Second)
 		}
-
-		for _, pod := range toCreate {
-			if err := ctrl.SetControllerReference(model, pod, r.Scheme); err != nil {
-				return ctrl.Result{}, fmt.Errorf("setting controller reference: %w", err)
-			}
-			if err := r.Client.Create(ctx, pod); err != nil {
-				return ctrl.Result{}, fmt.Errorf("creating pod: %w", err)
-			}
-		}
-	case scaleDiff > 0:
-		// Delete Pods.
-		log.Info("Need to delete pods", "replicaDiff", scaleDiff)
-
-		toDeleteCount := scaleDiffAbs
-		for _, pod := range allPods.Items {
-			if toDeleteCount == 0 {
-				break
-			}
-			if err := r.Client.Delete(ctx, &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: pod.Namespace,
-					Name:      pod.Name,
-				},
-			}); err != nil {
-				return ctrl.Result{}, fmt.Errorf("deleting pod: %w", err)
-			}
-			toDeleteCount--
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("executing pod plan: %w", err)
 		}
 	}
 
-	// Summarize all nodes.
+	// Summarize all pods.
 	var readyPods int32
 	for _, pod := range allPods.Items {
 		if utils.PodIsReady(&pod) {
@@ -173,11 +123,10 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		}
 	}
 
-	if statusReplicas := (kubeaiv1.ModelStatusReplicas{
-		All:   int32(len(allPods.Items)),
-		Ready: readyPods,
-	}); statusReplicas != model.Status.Replicas {
-		model.Status.Replicas = statusReplicas
+	model.Status.Replicas.All = int32(len(allPods.Items))
+	model.Status.Replicas.Ready = readyPods
+
+	if !reflect.DeepEqual(status0, model.Status) {
 		if err := r.Status().Update(ctx, model); err != nil {
 			return ctrl.Result{}, fmt.Errorf("updating status: %w", err)
 		}
@@ -188,6 +137,7 @@ func (r *ModelReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *ModelReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// TODO: Set Model concurrency. Pod rollouts can be slow.
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&kubeaiv1.Model{}).
 		Owns(&corev1.Pod{}).
@@ -203,7 +153,7 @@ func (r *ModelReconciler) apply(ctx context.Context, model *kubeaiv1.Model, obj 
 }
 */
 
-func (r *ModelReconciler) vLLMPodForModel(m *kubeaiv1.Model, index int32) *corev1.Pod {
+func (r *ModelReconciler) vLLMPodForModel(m *kubeaiv1.Model, profile ModelConfig) *corev1.Pod {
 	lbs := labelsForModel(m)
 	ann := r.annotationsForModel(m)
 	if _, ok := ann[kubeaiv1.ModelPodPortAnnotation]; !ok {
@@ -214,30 +164,21 @@ func (r *ModelReconciler) vLLMPodForModel(m *kubeaiv1.Model, index int32) *corev
 	args := []string{
 		"--model=" + strings.TrimPrefix(m.Spec.URL, "hf://"),
 		"--served-model-name=" + m.Name,
-		// NOTE: The following flag is a workaround for a known issue with VLLM where metrics wont show.
-		// https://github.com/vllm-project/vllm/issues/7188
-		"--disable-frontend-multiprocessing",
 	}
 	args = append(args, m.Spec.Args...)
-
-	var image string
-	if usesGPUResources(*m.Spec.Resources) {
-		image = r.ModelServers.VLLM.GPUImage
-	} else {
-		image = r.ModelServers.VLLM.CPUImage
-	}
 
 	env := []corev1.EnvVar{
 		{
 			// TODO: Conditionally set this token based on whether
 			// huggingface is the model source.
-			Name: "HUGGING_FACE_HUB_TOKEN",
+			Name: "HF_TOKEN",
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{
 						Name: r.HuggingfaceSecretName,
 					},
-					Key: "token",
+					Key:      "token",
+					Optional: ptr.To(true),
 				},
 			},
 		},
@@ -256,20 +197,29 @@ func (r *ModelReconciler) vLLMPodForModel(m *kubeaiv1.Model, index int32) *corev
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        fmt.Sprintf("model-%s-%d", m.Name, index),
 			Namespace:   m.Namespace,
 			Labels:      lbs,
 			Annotations: ann,
 		},
 		Spec: corev1.PodSpec{
-			NodeSelector: m.Spec.NodeSelector,
+			NodeSelector:       profile.NodeSelector,
+			Affinity:           profile.Affinity,
+			Tolerations:        profile.Tolerations,
+			RuntimeClassName:   profile.RuntimeClassName,
+			ServiceAccountName: r.ModelServerPods.ModelServiceAccountName,
+			SecurityContext:    r.ModelServerPods.ModelPodSecurityContext,
 			Containers: []corev1.Container{
 				{
-					Name:      "server",
-					Image:     image,
-					Args:      args,
-					Env:       env,
-					Resources: *m.Spec.Resources,
+					Name:            "server",
+					Image:           profile.Image,
+					Command:         []string{"python3", "-m", "vllm.entrypoints.openai.api_server"},
+					Args:            args,
+					Env:             env,
+					SecurityContext: r.ModelServerPods.ModelContainerSecurityContext,
+					Resources: corev1.ResourceRequirements{
+						Requests: profile.Requests,
+						Limits:   profile.Limits,
+					},
 					Ports: []corev1.ContainerPort{
 						{
 							ContainerPort: 8000,
@@ -277,12 +227,25 @@ func (r *ModelReconciler) vLLMPodForModel(m *kubeaiv1.Model, index int32) *corev
 							Name:          "http",
 						},
 					},
+					StartupProbe: &corev1.Probe{
+						// TODO: Decrease the default and make it configurable.
+						// Give the model 3 hours to start up.
+						FailureThreshold: 5400,
+						PeriodSeconds:    2,
+						TimeoutSeconds:   2,
+						SuccessThreshold: 1,
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								Path: "/health",
+								Port: intstr.FromString("http"),
+							},
+						},
+					},
 					ReadinessProbe: &corev1.Probe{
-						FailureThreshold:    3,
-						InitialDelaySeconds: 20,
-						PeriodSeconds:       10,
-						TimeoutSeconds:      2,
-						SuccessThreshold:    1,
+						FailureThreshold: 3,
+						PeriodSeconds:    10,
+						TimeoutSeconds:   2,
+						SuccessThreshold: 1,
 						ProbeHandler: corev1.ProbeHandler{
 							HTTPGet: &corev1.HTTPGetAction{
 								Path: "/health",
@@ -291,11 +254,10 @@ func (r *ModelReconciler) vLLMPodForModel(m *kubeaiv1.Model, index int32) *corev
 						},
 					},
 					LivenessProbe: &corev1.Probe{
-						FailureThreshold:    3,
-						InitialDelaySeconds: 900,
-						PeriodSeconds:       30,
-						TimeoutSeconds:      3,
-						SuccessThreshold:    1,
+						FailureThreshold: 3,
+						PeriodSeconds:    30,
+						TimeoutSeconds:   3,
+						SuccessThreshold: 1,
 						ProbeHandler: corev1.ProbeHandler{
 							HTTPGet: &corev1.HTTPGetAction{
 								Path: "/health",
@@ -328,7 +290,7 @@ func (r *ModelReconciler) vLLMPodForModel(m *kubeaiv1.Model, index int32) *corev
 	return pod
 }
 
-func (r *ModelReconciler) oLlamaPodForModel(m *kubeaiv1.Model, index int32) *corev1.Pod {
+func (r *ModelReconciler) oLlamaPodForModel(m *kubeaiv1.Model, profile ModelConfig) *corev1.Pod {
 	lbs := labelsForModel(m)
 	ann := r.annotationsForModel(m)
 
@@ -378,8 +340,8 @@ func (r *ModelReconciler) oLlamaPodForModel(m *kubeaiv1.Model, index int32) *cor
 	// before the Pod becomes Ready. (by default it will load on the first prompt request).
 	startupProbeScript := fmt.Sprintf("/bin/ollama pull %s && /bin/ollama cp %s %s",
 		ollamaModelRef, ollamaModelRef, m.Name)
-	if _, ok := featuresMap[kubeaiv1.ModelFeatureTextEmbedding]; ok {
-		// NOTE: Embedding text models do not support "ollama pull":
+	if _, ok := featuresMap[kubeaiv1.ModelFeatureTextGeneration]; ok {
+		// NOTE: Embedding text models do not support "ollama run":
 		//
 		// ollama run nomic-embed-text hey
 		// Error: "nomic-embed-text" does not support generate
@@ -389,20 +351,28 @@ func (r *ModelReconciler) oLlamaPodForModel(m *kubeaiv1.Model, index int32) *cor
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        fmt.Sprintf("model-%s-%d", m.Name, index),
 			Namespace:   m.Namespace,
 			Labels:      lbs,
 			Annotations: ann,
 		},
 		Spec: corev1.PodSpec{
-			NodeSelector: m.Spec.NodeSelector,
+			NodeSelector:       profile.NodeSelector,
+			Affinity:           profile.Affinity,
+			Tolerations:        profile.Tolerations,
+			RuntimeClassName:   profile.RuntimeClassName,
+			ServiceAccountName: r.ModelServerPods.ModelServiceAccountName,
+			SecurityContext:    r.ModelServerPods.ModelPodSecurityContext,
 			Containers: []corev1.Container{
 				{
-					Name:      "server",
-					Image:     r.ModelServers.Ollama.Image,
-					Args:      m.Spec.Args,
-					Env:       env,
-					Resources: *m.Spec.Resources,
+					Name:            "server",
+					Image:           profile.Image,
+					Args:            m.Spec.Args,
+					Env:             env,
+					SecurityContext: r.ModelServerPods.ModelContainerSecurityContext,
+					Resources: corev1.ResourceRequirements{
+						Requests: profile.Requests,
+						Limits:   profile.Limits,
+					},
 					Ports: []corev1.ContainerPort{
 						{
 							ContainerPort: 8000,
@@ -418,8 +388,8 @@ func (r *ModelReconciler) oLlamaPodForModel(m *kubeaiv1.Model, index int32) *cor
 						InitialDelaySeconds: 1,
 						PeriodSeconds:       3,
 						FailureThreshold:    10,
-						// Give the model pull 10 minutes to complete.
-						TimeoutSeconds: 600,
+						// Give the model pull 180 minutes to complete.
+						TimeoutSeconds: 60 * 180,
 						ProbeHandler: corev1.ProbeHandler{
 							Exec: &corev1.ExecAction{
 								Command: []string{
@@ -482,8 +452,310 @@ func (r *ModelReconciler) oLlamaPodForModel(m *kubeaiv1.Model, index int32) *cor
 
 }
 
+func (r *ModelReconciler) fasterWhisperPodForModel(m *kubeaiv1.Model, profile ModelConfig) *corev1.Pod {
+	lbs := labelsForModel(m)
+	ann := r.annotationsForModel(m)
+	if _, ok := ann[kubeaiv1.ModelPodPortAnnotation]; !ok {
+		ann[kubeaiv1.ModelPodPortAnnotation] = "8000"
+	}
+
+	args := []string{}
+	args = append(args, m.Spec.Args...)
+
+	env := []corev1.EnvVar{
+		{
+			Name:  "WHISPER__MODEL",
+			Value: strings.TrimPrefix(m.Spec.URL, "hf://"),
+		},
+		{
+			Name:  "ENABLE_UI",
+			Value: "false",
+		},
+		{
+			// TODO: Conditionally set this token based on whether
+			// huggingface is the model source.
+			Name: "HF_TOKEN",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: r.HuggingfaceSecretName,
+					},
+					Key:      "token",
+					Optional: ptr.To(true),
+				},
+			},
+		},
+	}
+	var envKeys []string
+	for key := range m.Spec.Env {
+		envKeys = append(envKeys, key)
+	}
+	sort.Strings(envKeys)
+	for _, key := range envKeys {
+		env = append(env, corev1.EnvVar{
+			Name:  key,
+			Value: m.Spec.Env[key],
+		})
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   m.Namespace,
+			Labels:      lbs,
+			Annotations: ann,
+		},
+		Spec: corev1.PodSpec{
+			NodeSelector:       profile.NodeSelector,
+			Affinity:           profile.Affinity,
+			Tolerations:        profile.Tolerations,
+			RuntimeClassName:   profile.RuntimeClassName,
+			ServiceAccountName: r.ModelServerPods.ModelServiceAccountName,
+			SecurityContext:    r.ModelServerPods.ModelPodSecurityContext,
+			Containers: []corev1.Container{
+				{
+					Name:            "server",
+					Image:           profile.Image,
+					Args:            args,
+					Env:             env,
+					SecurityContext: r.ModelServerPods.ModelContainerSecurityContext,
+					Resources: corev1.ResourceRequirements{
+						Requests: profile.Requests,
+						Limits:   profile.Limits,
+					},
+					Ports: []corev1.ContainerPort{
+						{
+							ContainerPort: 8000,
+							Protocol:      corev1.ProtocolTCP,
+							Name:          "http",
+						},
+					},
+					StartupProbe: &corev1.Probe{
+						// Give the model 30 minutes to start up.
+						FailureThreshold: 900,
+						PeriodSeconds:    2,
+						TimeoutSeconds:   2,
+						SuccessThreshold: 1,
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								Path: "/health",
+								Port: intstr.FromString("http"),
+							},
+						},
+					},
+					ReadinessProbe: &corev1.Probe{
+						FailureThreshold: 3,
+						PeriodSeconds:    10,
+						TimeoutSeconds:   2,
+						SuccessThreshold: 1,
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								Path: "/health",
+								Port: intstr.FromString("http"),
+							},
+						},
+					},
+					LivenessProbe: &corev1.Probe{
+						FailureThreshold: 3,
+						PeriodSeconds:    30,
+						TimeoutSeconds:   3,
+						SuccessThreshold: 1,
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								Path: "/health",
+								Port: intstr.FromString("http"),
+							},
+						},
+					},
+					VolumeMounts: []corev1.VolumeMount{
+						{
+							Name:      "dshm",
+							MountPath: "/dev/shm",
+						},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "dshm",
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{
+							Medium: corev1.StorageMediumMemory,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	return pod
+}
+
+func (r *ModelReconciler) infinityPodForModel(m *kubeaiv1.Model, profile ModelConfig) *corev1.Pod {
+	lbs := labelsForModel(m)
+	ann := r.annotationsForModel(m)
+
+	args := []string{
+		"v2",
+	}
+	args = append(args, m.Spec.Args...)
+
+	if _, ok := ann[kubeaiv1.ModelPodPortAnnotation]; !ok {
+		ann[kubeaiv1.ModelPodPortAnnotation] = "8000"
+	}
+
+	env := []corev1.EnvVar{
+		{
+			Name: "INFINITY_MODEL_ID",
+			// TODO: infinity supports multiple models, separate by comma.
+			Value: strings.TrimPrefix(m.Spec.URL, "hf://"),
+		},
+		{
+			Name:  "INFINITY_SERVED_MODEL_NAME",
+			Value: m.Name,
+		},
+		{
+			Name:  "INFINITY_URL_PREFIX",
+			Value: "/v1",
+		},
+		{
+			Name: "INFINITY_ENGINE",
+			// TODO: switch between optimum backend (cpu), nvidia/amd (torch), inf2 (inferentia) based on what is available.
+			Value: "torch",
+		},
+		{
+			Name:  "INFINITY_PORT",
+			Value: "8000",
+		},
+		{
+			// TODO: Conditionally set this token based on whether
+			// huggingface is the model source.
+			Name: "HF_TOKEN",
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: r.HuggingfaceSecretName,
+					},
+					Key:      "token",
+					Optional: ptr.To(true),
+				},
+			},
+		},
+	}
+	var envKeys []string
+	for key := range m.Spec.Env {
+		envKeys = append(envKeys, key)
+	}
+	sort.Strings(envKeys)
+	for _, key := range envKeys {
+		env = append(env, corev1.EnvVar{
+			Name:  key,
+			Value: m.Spec.Env[key],
+		})
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   m.Namespace,
+			Labels:      lbs,
+			Annotations: ann,
+		},
+		Spec: corev1.PodSpec{
+			NodeSelector:       profile.NodeSelector,
+			Affinity:           profile.Affinity,
+			Tolerations:        profile.Tolerations,
+			RuntimeClassName:   profile.RuntimeClassName,
+			ServiceAccountName: r.ModelServerPods.ModelServiceAccountName,
+			SecurityContext:    r.ModelServerPods.ModelPodSecurityContext,
+			Containers: []corev1.Container{
+				{
+					Name:  "server",
+					Image: profile.Image,
+					Args:  args,
+					Env:   env,
+					Resources: corev1.ResourceRequirements{
+						Requests: profile.Requests,
+						Limits:   profile.Limits,
+					},
+
+					Ports: []corev1.ContainerPort{
+						{
+							ContainerPort: 8000,
+							Protocol:      corev1.ProtocolTCP,
+							Name:          "http",
+						},
+					},
+					StartupProbe: &corev1.Probe{
+						// TODO: Decrease the default and make it configurable.
+						// Give the model 20 minutes to start up.
+						FailureThreshold: 600,
+						PeriodSeconds:    2,
+						TimeoutSeconds:   2,
+						SuccessThreshold: 1,
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								Path: "/health",
+								Port: intstr.FromString("http"),
+							},
+						},
+					},
+					ReadinessProbe: &corev1.Probe{
+						FailureThreshold: 3,
+						PeriodSeconds:    10,
+						TimeoutSeconds:   2,
+						SuccessThreshold: 1,
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								Path: "/health",
+								Port: intstr.FromString("http"),
+							},
+						},
+					},
+					LivenessProbe: &corev1.Probe{
+						FailureThreshold: 3,
+						PeriodSeconds:    30,
+						TimeoutSeconds:   3,
+						SuccessThreshold: 1,
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								Path: "/health",
+								Port: intstr.FromString("http"),
+							},
+						},
+					},
+					VolumeMounts: []corev1.VolumeMount{
+						{
+							Name:      "dshm",
+							MountPath: "/dev/shm",
+						},
+					},
+				},
+			},
+			Volumes: []corev1.Volume{
+				{
+					Name: "dshm",
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{
+							Medium: corev1.StorageMediumMemory,
+							// TODO: Set size limit
+						},
+					},
+				},
+			},
+		},
+	}
+
+	return pod
+}
+
 func labelsForModel(m *kubeaiv1.Model) map[string]string {
-	return map[string]string{"app": "model", "model": m.Name}
+	engineLowerCase := strings.ToLower(m.Spec.Engine)
+	return map[string]string{
+		"app":                          "model",
+		"model":                        m.Name,
+		"app.kubernetes.io/name":       engineLowerCase,
+		"app.kubernetes.io/instance":   engineLowerCase + "-" + m.Name,
+		"app.kubernetes.io/managed-by": "kubeai",
+	}
 }
 
 func (r *ModelReconciler) annotationsForModel(m *kubeaiv1.Model) map[string]string {
@@ -508,26 +780,27 @@ func (r *ModelReconciler) annotationsForModel(m *kubeaiv1.Model) map[string]stri
 	return ann
 }
 
-func usesGPUResources(res corev1.ResourceRequirements) bool {
-	_, gpuLimits := res.Limits[corev1.ResourceName("nvidia.com/gpu")]
-	_, gpuRequests := res.Limits[corev1.ResourceName("nvidia.com/gpu")]
-	return gpuLimits || gpuRequests
+type ModelConfig struct {
+	config.ResourceProfile
+	Image string
 }
 
-func (r *ModelReconciler) applyResourceProfile(model *kubeaiv1.Model) (bool, error) {
+func (r *ModelReconciler) getModelConfig(model *kubeaiv1.Model) (ModelConfig, error) {
+	var result ModelConfig
+
 	split := strings.Split(model.Spec.ResourceProfile, ":")
 	if len(split) != 2 {
-		return false, fmt.Errorf("invalid resource profile: %q, should match <name>:<multiple>, example: L4:2", model.Spec.ResourceProfile)
+		return result, fmt.Errorf("invalid resource profile: %q, should match <name>:<multiple>, example: nvidia-gpu-l4:2", model.Spec.ResourceProfile)
 	}
 	name := split[0]
 	multiple, err := strconv.Atoi(split[1])
 	if err != nil {
-		return false, fmt.Errorf("invalid multiple in resource profile multiple: %q: %w", split[1], err)
+		return result, fmt.Errorf("invalid multiple in resource profile multiple: %q: %w", split[1], err)
 	}
 
 	profile, ok := r.ResourceProfiles[name]
 	if !ok {
-		return false, fmt.Errorf("resource profile not found: %q", name)
+		return result, fmt.Errorf("resource profile not found: %q", name)
 	}
 
 	requests := make(corev1.ResourceList)
@@ -544,24 +817,71 @@ func (r *ModelReconciler) applyResourceProfile(model *kubeaiv1.Model) (bool, err
 		limits[key] = q
 	}
 
-	var changed bool
+	result.ResourceProfile = profile
+	// Apply the multiplied requests and limits to the profile.
+	result.Requests = requests
+	result.Limits = limits
 
-	resources := corev1.ResourceRequirements{
-		Requests: requests,
-		Limits:   limits,
+	image, err := r.lookupServerImage(model, profile)
+	if err != nil {
+		return result, fmt.Errorf("looking up server image: %w", err)
 	}
-	if model.Spec.Resources == nil || !resourcesEqual(model.Spec.Resources.Requests, requests) || !resourcesEqual(model.Spec.Resources.Limits, limits) {
-		model.Spec.Resources = &resources
-		changed = true
+	result.Image = image
+
+	return result, nil
+}
+
+func (r *ModelReconciler) lookupServerImage(model *kubeaiv1.Model, profile config.ResourceProfile) (string, error) {
+	if model.Spec.Image != "" {
+		return model.Spec.Image, nil
 	}
 
-	nodeSelector := profile.NodeSelector
-	if !selectorsEqual(nodeSelector, model.Spec.NodeSelector) {
-		model.Spec.NodeSelector = nodeSelector
-		changed = true
+	var serverImgs map[string]string
+	switch model.Spec.Engine {
+	case kubeaiv1.OLlamaEngine:
+		serverImgs = r.ModelServers.OLlama.Images
+	case kubeaiv1.FasterWhisperEngine:
+		serverImgs = r.ModelServers.FasterWhisper.Images
+	case kubeaiv1.InfinityEngine:
+		serverImgs = r.ModelServers.Infinity.Images
+	default:
+		serverImgs = r.ModelServers.VLLM.Images
 	}
 
-	return changed, nil
+	// If no image name is provided for a profile, use the default image name.
+	const defaultImageName = "default"
+	imageName := defaultImageName
+	if profile.ImageName != "" {
+		imageName = profile.ImageName
+	}
+
+	if img, ok := serverImgs[imageName]; ok {
+		return img, nil
+	}
+
+	// If the specific profile image name does not exist, use the default image name.
+	if img, ok := serverImgs[defaultImageName]; ok {
+		return img, nil
+	} else {
+		return "", fmt.Errorf("missing default server image")
+	}
+}
+
+func (r *ModelReconciler) applyAutoscalingReplicaBounds(model *kubeaiv1.Model) bool {
+	min := model.Spec.MinReplicas
+	max := model.Spec.MaxReplicas
+
+	if model.Spec.Replicas == nil || *model.Spec.Replicas < min {
+		model.Spec.Replicas = ptr.To(min)
+		return true
+	}
+
+	if max != nil && *model.Spec.Replicas > *max {
+		model.Spec.Replicas = ptr.To(*max)
+		return true
+	}
+
+	return false
 }
 
 func (r *ModelReconciler) applySelfLabels(model *kubeaiv1.Model) bool {

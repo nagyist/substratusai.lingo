@@ -1,4 +1,4 @@
-# Tutorial: Deploying KubeAI with Langtrace
+# Deploying KubeAI with Langtrace
 
 Langtrace is an open source tool that helps you with tracing and monitoring
 your AI calls. It includes a self-hosted UI that for example shows you the
@@ -16,28 +16,33 @@ kind create cluster # OR: minikube start
 ```
 
 Install Langtrace:
-```
+```bash
 helm repo add langtrace https://Scale3-Labs.github.io/langtrace-helm-chart
 helm repo update
 helm install langtrace langtrace/langtrace
 ```
 
-Install KubeAI:
+Install KubeAI and wait for all components to be ready (may take a minute).
 ```bash
-helm repo add kubeai https://substratusai.github.io/kubeai/
+helm repo add kubeai https://www.kubeai.org
 helm repo update
-cat <<EOF > helm-values.yaml
-models:
-  catalog:
-    gemma2-2b-cpu:
-      enabled: true
-      minReplicas: 1
+helm install kubeai kubeai/kubeai --wait --timeout 10m
+```
+
+Install the gemma2-2b-cpu model:
+
+```bash
+cat <<EOF > kubeai-models.yaml
+catalog:
+  gemma2-2b-cpu:
+    enabled: true
+    minReplicas: 1
 EOF
 
-helm upgrade --install kubeai kubeai/kubeai \
-    --wait --timeout 10m \
-    -f ./helm-values.yaml
+helm install kubeai-models kubeai/models \
+    -f ./kubeai-models.yaml
 ```
+
 
 Create a local Python environment and install dependencies:
 ```

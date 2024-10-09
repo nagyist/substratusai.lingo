@@ -1,0 +1,230 @@
+all:
+  # Enable all models instead of enabling them one-by-one via .catalog.<name>.enabled
+  enabled: false
+
+catalog:
+  llama-3.2-11b-vision-instruct-l4:
+    enabled: false
+    features: [TextGeneration]
+    url: hf://neuralmagic/Llama-3.2-11B-Vision-Instruct-FP8-dynamic
+    engine: VLLM
+    env:
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+    args:
+      - --max-model-len=8192
+      - --max-num-batched-token=8192
+      - --gpu-memory-utilization=0.99
+      - --enforce-eager
+      - --disable-log-requests
+      - --max-num-seqs=16
+      # Setting this is broken in vllm 0.6.2
+      #    - --kv-cache-dtype=fp8
+    resourceProfile: nvidia-gpu-l4:1
+    minReplicas: 1
+    maxReplicas: 1
+    targetRequests: 32
+  # Mistral #
+  e5-mistral-7b-instruct-cpu:
+    enabled: false
+    features: ["TextEmbedding"]
+    owner: intfloat
+    url: "hf://intfloat/e5-mistral-7b-instruct"
+    engine: VLLM
+    # TODO: Adjust - the memory associated with this request is too low.
+    resourceProfile: cpu:1
+    args:
+    - --gpu-memory-utilization=0.9
+  # Gemma #
+  gemma2-2b-cpu:
+    enabled: false
+    features: ["TextGeneration"]
+    owner: google
+    url: "ollama://gemma2:2b"
+    engine: OLlama
+    resourceProfile: cpu:2
+  gemma-2b-it-tpu:
+    enabled: false
+    features: ["TextGeneration"]
+    owner: google
+    url: "hf://google/gemma-2b-it"
+    engine: VLLM
+    resourceProfile: google-tpu-v5e-1x1:1
+    args:
+    - --disable-log-requests
+  # gemma2-9b-it-fp8-tpu:
+  #   enabled: false
+  #   features: ["TextGeneration"]
+  #   owner: neuralmagic
+  #   # vLLM logs: "ValueError: fp8 quantization is currently not supported in TPU Backend."
+  #   #url: "hf://neuralmagic/gemma-2-9b-it-FP8"
+  #   engine: VLLM
+  #   resourceProfile: google-tpu-v5e-1x1:1
+  #   args:
+  #   - --disable-log-requests
+  # gemma2-9b-it-int8-tpu:
+  #   enabled: false
+  #   features: ["TextGeneration"]
+  #   owner: neuralmagic
+  #   # vLLM logs: "ValueError: compressed-tensors quantization is currently not supported in TPU Backend."
+  #   #url: "hf://neuralmagic/gemma-2-9b-it-quantized.w8a8"
+  #   #url: "hf://neuralmagic/gemma-2-9b-it-quantized.w8a16"
+  #   engine: VLLM
+  #   resourceProfile: google-tpu-v5e-1x1:1
+  #   args:
+  #   - --disable-log-requests
+  # Llama #
+  llama-3.1-8b-instruct-cpu:
+    enabled: false
+    features: ["TextGeneration"]
+    owner: "meta-llama"
+    url: "hf://meta-llama/Meta-Llama-3.1-8B-Instruct"
+    engine: VLLM
+    resourceProfile: cpu:6
+    env:
+      VLLM_CPU_KVCACHE_SPACE: "4"
+    args:
+    - --max-model-len=32768
+    - --max-num-batched-token=32768
+  llama-3.1-8b-instruct-tpu:
+    enabled: false
+    features: ["TextGeneration"]
+    owner: meta-llama
+    url: "hf://meta-llama/Meta-Llama-3.1-8B-Instruct"
+    engine: VLLM
+    resourceProfile: google-tpu-v5e-2x2:4
+    args:
+    - --disable-log-requests
+    - --swap-space=8
+    - --tensor-parallel-size=4
+    - --num-scheduler-steps=4
+    - --max-model-len=8192
+    # Set backend to ray b/c using "--distributed-executor-backend=mp" (or letting it default)
+    # results in the following error:
+    #
+    # Traceback (most recent call last):
+    #   File "/usr/local/lib/python3.10/multiprocessing/process.py", line 314, in _bootstrap
+    #     self.run()
+    #   File "/usr/local/lib/python3.10/multiprocessing/process.py", line 108, in run
+    #     self._target(*self._args, **self._kwargs)
+    #   File "/workspace/vllm/vllm/entrypoints/openai/rpc/server.py", line 236, in run_rpc_server
+    #     server = AsyncEngineRPCServer(async_engine_args, usage_context, rpc_path)
+    #   File "/workspace/vllm/vllm/entrypoints/openai/rpc/server.py", line 34, in __init__
+    #     self.engine = AsyncLLMEngine.from_engine_args(
+    #   File "/workspace/vllm/vllm/engine/async_llm_engine.py", line 732, in from_engine_args
+    #     executor_class = cls._get_executor_cls(engine_config)
+    #   File "/workspace/vllm/vllm/engine/async_llm_engine.py", line 675, in _get_executor_cls
+    #     assert distributed_executor_backend is None
+    # AssertionError
+    #
+    - --distributed-executor-backend=ray
+  llama-3.1-8b-instruct-fp8-l4:
+    enabled: false
+    features: ["TextGeneration"]
+    owner: "neuralmagic"
+    url: "hf://neuralmagic/Meta-Llama-3.1-8B-Instruct-FP8"
+    engine: VLLM
+    resourceProfile: nvidia-gpu-l4:1
+    args:
+    - --max-model-len=16384
+    - --max-num-batched-token=16384
+    - --gpu-memory-utilization=0.9
+    - --disable-log-requests
+  llama-3.1-70b-instruct-fp8-h100:
+    enabled: false
+    features: [TextGeneration]
+    url: hf://neuralmagic/Meta-Llama-3.1-70B-Instruct-FP8
+    engine: VLLM
+    args:
+      - --max-model-len=65536
+      - --max-num-batched-token=65536
+      - --max-num-seqs=1024
+      - --gpu-memory-utilization=0.9
+      - --tensor-parallel-size=2
+      - --enable-prefix-caching
+      - --disable-log-requests
+    resourceProfile: nvidia-gpu-h100:2
+    targetRequests: 500
+  llama-3.1-405b-instruct-fp8-h100:
+    enabled: false
+    features: [TextGeneration]
+    url: hf://neuralmagic/Meta-Llama-3.1-405B-Instruct-FP8
+    engine: VLLM
+    args:
+      - --max-model-len=65536
+      - --max-num-batched-token=65536
+      - --gpu-memory-utilization=0.9
+      - --tensor-parallel-size=8
+      - --enable-prefix-caching
+      - --disable-log-requests
+      - --max-num-seqs=1024
+      - --kv-cache-dtype=fp8
+    # You can also use nvidia-gpu-a100-80gb:8
+    resourceProfile: nvidia-gpu-h100:8
+    targetRequests: 500
+  llama-3.1-405b-instruct-fp8-a100-80b:
+    features: [TextGeneration]
+    url: hf://neuralmagic/Meta-Llama-3.1-405B-Instruct-FP8
+    engine: VLLM
+    env:
+      VLLM_ATTENTION_BACKEND: FLASHINFER
+    args:
+      - --max-model-len=65536
+      - --max-num-batched-token=65536
+      - --gpu-memory-utilization=0.98
+      - --tensor-parallel-size=8
+      - --enable-prefix-caching
+      - --disable-log-requests
+      - --max-num-seqs=128
+      - --kv-cache-dtype=fp8
+      - --enforce-eager
+      - --enable-chunked-prefill=false
+      - --num-scheduler-steps=8
+    targetRequests: 128
+    minReplicas: 1
+    maxReplicas: 1
+    resourceProfile: nvidia-gpu-a100-80gb:8
+  nomic-embed-text-cpu:
+    enabled: false
+    features: ["TextEmbedding"]
+    owner: nomic
+    url: "ollama://nomic-embed-text"
+    engine: OLlama
+    resourceProfile: cpu:1
+  bge-embed-text-cpu:
+    enabled: false
+    features: ["TextEmbedding"]
+    owner: baai
+    url: "hf://BAAI/bge-small-en-v1.5"
+    engine: Infinity
+    resourceProfile: cpu:1
+  # Opt #
+  opt-125m-cpu:
+    enabled: false
+    features: ["TextGeneration"]
+    owner: facebook
+    url: "hf://facebook/opt-125m"
+    engine: VLLM
+    # TODO: Adjust - the memory associated with this request is too low.
+    resourceProfile: cpu:1
+  opt-125m-l4:
+    enabled: false
+    features: ["TextGeneration"]
+    owner: facebook
+    url: "hf://facebook/opt-125m"
+    engine: VLLM
+    resourceProfile: nvidia-gpu-l4:1
+  # Qwen #
+  qwen2-500m-cpu:
+    enabled: false
+    features: ["TextGeneration"]
+    owner: alibaba
+    url: "ollama://qwen2:0.5b"
+    engine: OLlama
+    resourceProfile: cpu:1
+  faster-whisper-medium-en-cpu:
+    enabled: false
+    features: ["SpeechToText"]
+    owner: Systran
+    url: "hf://Systran/faster-whisper-medium.en"
+    engine: FasterWhisper
+    resourceProfile: cpu:1

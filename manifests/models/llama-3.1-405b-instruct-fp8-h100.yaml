@@ -1,0 +1,21 @@
+# Source: models/templates/models.yaml
+apiVersion: kubeai.org/v1
+kind: Model
+metadata:
+  name: llama-3.1-405b-instruct-fp8-h100
+spec:
+  features: [TextGeneration]
+  owner:
+  url: hf://neuralmagic/Meta-Llama-3.1-405B-Instruct-FP8
+  engine: VLLM
+  args:
+    - --max-model-len=65536
+    - --max-num-batched-token=65536
+    - --gpu-memory-utilization=0.9
+    - --tensor-parallel-size=8
+    - --enable-prefix-caching
+    - --disable-log-requests
+    - --max-num-seqs=1024
+    - --kv-cache-dtype=fp8
+  targetRequests: 500
+  resourceProfile: nvidia-gpu-h100:8

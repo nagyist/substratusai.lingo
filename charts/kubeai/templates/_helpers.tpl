@@ -62,15 +62,37 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
+Create the name of the service account to use for model pods
+*/}}
+{{- define "models.serviceAccountName" -}}
+{{- if .Values.modelServiceAccount.create }}
+{{- default (printf "%s-models" (include "kubeai.fullname" .)) .Values.modelServiceAccount.name }}
+{{- else }}
+{{- default "default" .Values.modelServiceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
 Create the name of the huggingface secret to use
 */}}
 {{- define "kubeai.huggingfaceSecretName" -}}
 {{- if .Values.secrets.huggingface.create -}}
-{{- default (include "kubeai.fullname" .) .Values.secrets.huggingface.name }}
+{{- if .Values.secrets.huggingface.name -}}
+{{- .Values.secrets.huggingface.name -}}
+{{- else }}
+{{- (include "kubeai.fullname" .)}}-huggingface
+{{- end}}
 {{- else }}
 {{- if not .Values.secrets.huggingface.name -}}
 {{ fail "if secrets.huggingface.create is false, secrets.huggingface.name is required" }}
 {{- end }}
 {{- .Values.secrets.huggingface.name }}
 {{- end }}
+{{- end }}
+
+{{/*
+Set the name of the configmap to use for storing model autoscaling state
+*/}}
+{{- define "models.autoscalerStateConfigMapName" -}}
+{{- default (printf "%s-autoscaler-state" (include "kubeai.fullname" .)) .Values.modelAutoscaling.stateConfigMapName }}
 {{- end }}

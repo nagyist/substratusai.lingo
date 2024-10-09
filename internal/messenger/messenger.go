@@ -13,18 +13,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/substratusai/kubeai/internal/metrics"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"gocloud.dev/pubsub"
-	_ "gocloud.dev/pubsub/awssnssqs"
-	_ "gocloud.dev/pubsub/azuresb"
-	_ "gocloud.dev/pubsub/gcppubsub"
-	_ "gocloud.dev/pubsub/kafkapubsub"
-	_ "gocloud.dev/pubsub/natspubsub"
-	_ "gocloud.dev/pubsub/rabbitpubsub"
 )
 
 type Messenger struct {
-	modelScaler   ModelScaler
-	modelResolver ModelResolver
+	modelScaler ModelScaler
+	resolver    EndpointResolver
 
 	HTTPC *http.Client
 
@@ -46,7 +43,7 @@ func NewMessenger(
 	maxHandlers int,
 	errorMaxBackoff time.Duration,
 	modelScaler ModelScaler,
-	modelResolver ModelResolver,
+	resolver EndpointResolver,
 	httpClient *http.Client,
 ) (*Messenger, error) {
 	requests, err := pubsub.OpenSubscription(ctx, requestsURL)
@@ -61,7 +58,7 @@ func NewMessenger(
 
 	return &Messenger{
 		modelScaler:     modelScaler,
-		modelResolver:   modelResolver,
+		resolver:        resolver,
 		HTTPC:           httpClient,
 		requestsURL:     requestsURL,
 		requests:        requests,
@@ -76,7 +73,7 @@ type ModelScaler interface {
 	ScaleAtLeastOneReplica(ctx context.Context, model string) error
 }
 
-type ModelResolver interface {
+type EndpointResolver interface {
 	AwaitBestAddress(ctx context.Context, model string) (string, func(), error)
 }
 
@@ -87,6 +84,7 @@ func (m *Messenger) Start(ctx context.Context) error {
 	const maxRestartAttempts = 20
 	const maxRestartBackoff = 10 * time.Second
 
+	log.Printf("Messenger starting receive loop for requests subscription %q", m.requestsURL)
 recvLoop:
 	for {
 		msg, err := m.requests.Receive(ctx)
@@ -199,6 +197,13 @@ func (m *Messenger) handleRequest(ctx context.Context, msg *pubsub.Message) {
 		return
 	}
 
+	metricAttrs := metric.WithAttributeSet(attribute.NewSet(
+		metrics.AttrRequestModel.String(req.model),
+		metrics.AttrRequestType.String(metrics.AttrRequestTypeMessage),
+	))
+	metrics.InferenceRequestsActive.Add(ctx, 1, metricAttrs)
+	defer metrics.InferenceRequestsActive.Add(ctx, -1, metricAttrs)
+
 	modelExists, err := m.modelScaler.ModelExists(ctx, req.model)
 	if err != nil {
 		m.sendResponse(req, m.jsonError("error checking if model exists: %v", err), http.StatusInternalServerError)
@@ -216,7 +221,7 @@ func (m *Messenger) handleRequest(ctx context.Context, msg *pubsub.Message) {
 
 	log.Printf("Awaiting host for message %s", msg.LoggableID)
 
-	host, completeFunc, err := m.modelResolver.AwaitBestAddress(ctx, req.model)
+	host, completeFunc, err := m.resolver.AwaitBestAddress(ctx, req.model)
 	if err != nil {
 		m.sendResponse(req, m.jsonError("error awaiting host for backend: %v", err), http.StatusBadGateway)
 		return
