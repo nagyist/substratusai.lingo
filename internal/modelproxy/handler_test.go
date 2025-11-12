@@ -304,3 +304,55 @@ func (t *testModelInterface) AwaitBestAddress(ctx context.Context, req *apiutils
 	t.requestedAdapter = req.Adapter
 	return t.address, func() {}, nil
 }
+
+func TestHandlerResponsesAPI(t *testing.T) {
+	const (
+		model1     = "model1"
+		maxRetries = 3
+	)
+	models := map[string]testMockModel{
+		model1: {},
+	}
+
+	metricstest.Init(t)
+
+	// Mock backend.
+	backendCalled := false
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backendCalled = true
+		bdy, err := io.ReadAll(r.Body)
+		assert.NoError(t, err, "The request body should be readable")
+		assert.Contains(t, string(bdy), model1, "Request should contain model name")
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"result":"ok"}`))
+	}))
+	defer backend.Close()
+
+	// Setup handler.
+	testInf := &testModelInterface{
+		models:  models,
+		address: backend.Listener.Addr().String(),
+	}
+	h := NewHandler(testInf, testInf, maxRetries, nil)
+	server := httptest.NewServer(h)
+	defer server.Close()
+
+	// Issue request to the /v1/responses endpoint.
+	client := &http.Client{}
+	reqBody := fmt.Sprintf(`{"model":%q,"messages":[]}`, model1)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/responses", strings.NewReader(reqBody))
+	require.NoError(t, err)
+
+	resp, err := client.Do(req)
+	require.NoError(t, err, "The client request should not fail")
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	// Assert on response.
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "Unexpected response code to client")
+	assert.Equal(t, `{"result":"ok"}`, string(respBody), "Unexpected response body to client")
+	assert.True(t, backendCalled, "Backend should have been called")
+}

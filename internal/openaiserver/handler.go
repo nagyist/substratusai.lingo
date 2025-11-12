@@ -40,6 +40,7 @@ func NewHandler(k8sClient client.Client, modelProxy *modelproxy.Handler) *Handle
 	handle("/openai/v1/embeddings", http.StripPrefix("/openai", modelProxy))
 	handle("/openai/v1/rerank", http.StripPrefix("/openai", modelProxy))
 	handle("/openai/v1/audio/transcriptions", http.StripPrefix("/openai", modelProxy))
+	handle("/openai/v1/responses", http.StripPrefix("/openai", modelProxy))
 	handle("/openai/v1/models", http.HandlerFunc(h.getModels))
 
 	// Add HTTP instrumentation for the whole server.
