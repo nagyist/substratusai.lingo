@@ -10,7 +10,10 @@ metadata:
   {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  features: {{ $model.features }}
+  {{- with $model.features }}
+  features:
+  {{- toYaml . | nindent 4 }}
+  {{- end }}
   {{- with $model.owner }}
   owner: {{ . }}
   {{- end }}
@@ -50,5 +53,51 @@ spec:
   files:
   {{- toYaml . | nindent 4 }}
   {{- end }}
+  {{- if .replicas }}
+  replicas: {{ .replicas }}
+  {{- end }}
+
+  {{- if ne .autoscalingDisabled nil }}
+  autoscalingDisabled: {{ .autoscalingDisabled }}
+  {{- end }}
+
+  {{- if .image }}
+  image: {{ .image | quote }}
+  {{- end }}
+
+  {{- if .envFrom }}
+  envFrom:
+    {{- toYaml .envFrom | nindent 4 }}
+  {{- end }}
+
+  {{- if .priorityClassName }}
+  priorityClassName: {{ .priorityClassName | quote }}
+  {{- end }}
+
+  {{- with .loadBalancing }}
+  loadBalancing:
+    {{- if .strategy }}
+    strategy: {{ .strategy | quote }}
+    {{- end }}
+    {{- with .prefixHash }}
+    prefixHash:
+      {{- if .salt }}
+      salt: {{ .salt | quote }}
+      {{- end }}
+      {{- if .header }}
+      header: {{ .header | quote }}
+      {{- end }}
+      {{- if .queryParam }}
+      queryParam: {{ .queryParam | quote }}
+      {{- end }}
+      {{- if .cookie }}
+      cookie: {{ .cookie | quote }}
+      {{- end }}
+      {{- if .fixed }}
+      fixed: {{ .fixed | quote }}
+      {{- end }}
+    {{- end }}
+  {{- end }}
+
 {{- end}}
 {{- end}}

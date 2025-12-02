@@ -1,0 +1,78 @@
+# YAML
+# File: 'charts/models/values.yaml'
+
+# Global toggle to enable all catalog entries (each entry can also override via enabled)
+all:
+  enabled: false  # bool: set true to enable all models by default
+
+# Catalog of models to install
+catalog:
+  my-custom-model:
+    enabled: true  # bool: enable this model
+
+    # Optional metadata for the Model object
+    labels:
+      team: ml-platform
+      env: prod
+
+    # CRD expects an array of enum values: TextGeneration, TextEmbedding, Reranking, SpeechToText
+    features:
+      - TextGeneration
+      - TextEmbedding
+
+    owner: nlp-team
+
+    # URL must use one of the supported schemes from the CRD validation rules
+    url: hf://example-org/my-custom-model
+
+    # Adapters require both name and url, and are only valid with the VLLM engine
+    adapters:
+      - name: quantize
+        url: s3://example-bucket/adapters/my-custom-model/quantize.bin
+
+    engine: VLLM
+
+    # Args render as a string array in the template/CRD
+    args:
+      - --max-model-len=8192
+      - --temperature=0.2
+
+    # Plain string map for env; for secrets/configmaps use envFrom below
+    env:
+      VLLM_WORKER_MULTIPROC_METHOD: spawn
+      LOG_LEVEL: info
+
+    envFrom:
+      - configMapRef:
+          name: model-config
+      - secretRef:
+          name: model-secrets
+
+    minReplicas: 1
+    maxReplicas: 5
+    targetRequests: 50
+    scaleDownDelaySeconds: 120
+
+    # Fixed replica count (only set when you really need to pin replicas)
+    replicas: 2
+    autoscalingDisabled: false
+
+    resourceProfile: gpu-small
+    cacheProfile: default
+
+    files:
+      - path: /models/my-custom-model.bin
+        content: |
+          placeholder-artifacts-go-here
+
+    image: ghcr.io/example/my-model-engine:1.2.3
+    priorityClassName: high-priority
+
+    loadBalancing:
+      strategy: PrefixHash
+      prefixHash:
+        salt: my-salt
+        header: X-User-Id
+        queryParam: session
+        cookie: sessionid
+        fixed: fixed-key
